@@ -27,6 +27,9 @@
 
 import argparse
 import copy
+import dill
+import onnx
+import onnxruntime
 import glob
 import os
 import re
@@ -248,6 +251,27 @@ def maybe_save_checkpoint(args, model, ema_model, optimizer, scaler, epoch,
         checkpoint['scaler'] = scaler.state_dict()
     torch.save(checkpoint, fpath)
 
+def save_checkpoint_before_train(args, model, ema_model, optimizer, scaler, epoch,
+                          total_iter, config, final_checkpoint=False):
+    if args.local_rank != 0:
+        return
+
+  
+    fpath = os.path.join(args.output, f"FastPitch_checkpoint_{epoch}.pt")
+    print(f"Saving model and optimizer state at epoch {epoch} to {fpath}")
+    ema_dict = None if ema_model is None else ema_model.state_dict()
+    checkpoint = {'epoch': epoch,
+                  'iteration': total_iter,
+                  'config': config,
+                  'state_dict': model.state_dict(),
+                  # 'ema_state_dict': ema_dict,
+                  'optimizer': optimizer.state_dict()}
+    if args.amp:
+        checkpoint['scaler'] = scaler.state_dict()
+    # print(f"Model state dict is this: {model.state_dict()}")
+    print(f"EMA: {ema_dict}")
+    torch.save(checkpoint, fpath)
+
 
 def load_checkpoint(args, model, ema_model, optimizer, scaler, epoch,
                     total_iter, config, filepath):
@@ -360,6 +384,53 @@ def apply_multi_tensor_ema(decay, model_weights, ema_weights, overflow_buf):
         65536, overflow_buf, [ema_weights, model_weights, ema_weights],
         decay, 1-decay, -1)
 
+def export_to_onnx_or_torchscript(model, dummy_input, torch_output, name):
+    try:
+        filename = f"/content/output/models/FastPitch_trchscript_{name}.onnx"
+        torch.onnx.export(model, dummy_input, filename, verbose=True,  opset_version=12)
+
+        # check onnx
+        import_from_onnx(filename, dummy_input, torch_output)
+    except:
+        # traced_script_module = torch.jit.trace(model, dummy_input)
+
+        # Save the TorchScript model
+        # traced_script_module.save(f"/content/output/models/FastPitch_trchscript_{name}.pt")
+        torch.jit.save(torch.jit.script(model), f"/content/output/models/FastPitch_trchscript_{name}.pt")
+
+
+    torch.onnx.export(model, dummy_input, "/content/TTS_HW/output/FastPitch_trchscript.onnx", verbose=True,  opset_version=12)
+
+
+def import_from_onnx(filename, dummy_input, torch_out):
+    
+
+    # onnx_model = onnx.load("/content/TTS_HW/output/FastPitch_trchscript.onnx")
+    onnx_model = onnx.load(filename)
+    onnx.checker.check_model(onnx_model)
+
+
+    ort_session = onnxruntime.InferenceSession(filename)
+
+
+    def to_numpy(tensor):
+        return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
+
+    # compute ONNX Runtime output prediction
+    x = dummy_input
+
+    ort_inputs = {ort_session.get_inputs()[0].name: to_numpy(x)}
+    ort_outs = ort_session.run(None, ort_inputs)
+
+    # compare ONNX Runtime and PyTorch results
+    if torch_out is not None:
+        np.testing.assert_allclose(to_numpy(torch_out), ort_outs[0], rtol=1e-03, atol=1e-05)
+
+    print("Exported model has been tested with ONNXRuntime, and the result looks good!")
+
+def save_inputs(input_x, filename):
+    # print(f'HOOK CALLED!!!!!!{filename} ^')
+    torch.save(input_x, filename)
 
 def main():
     parser = argparse.ArgumentParser(description='PyTorch FastPitch Training',
@@ -408,6 +479,7 @@ def main():
     model.pitch_mean[0] = args.pitch_mean
     model.pitch_std[0] = args.pitch_std
 
+
     kw = dict(lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-9,
               weight_decay=args.weight_decay)
     if args.optimizer == 'adam':
@@ -429,246 +501,81 @@ def main():
             model, device_ids=[args.local_rank], output_device=args.local_rank,
             find_unused_parameters=True)
 
+    hooks = {}
+    modules = list(model.named_modules())
+    for name, module in modules:
+        hooks[name] = lambda mod, input_x, output : save_inputs(input_x, \
+        f"/content/output/modules_inputs/input-from-train-per-module-{mod.__class__.__name__}.pt")
+        # f"/content/output/modules_inputs/input-from-train-per-module-{name}.pt")
+    for name, module in modules:
+        # print(f"/content/output/modules_inputs/input-from-train-per-module-{name}.pt")
+        module.register_forward_hook(hooks[name])
+
     if args.pyprof:
         pyprof.init(enable_function_stack=True)
 
     start_epoch = [1]
     start_iter = [0]
 
-    assert args.checkpoint_path is None or args.resume is False, (
-        "Specify a single checkpoint source")
-    if args.checkpoint_path is not None:
-        ch_fpath = args.checkpoint_path
-    elif args.resume:
-        ch_fpath = last_checkpoint(args.output)
-    else:
-        ch_fpath = None
+    save_checkpoint_before_train(args, model, ema_model, optimizer, scaler,
+                        start_epoch, start_iter, model_config)
 
-    if ch_fpath is not None:
-        load_checkpoint(args, model, ema_model, optimizer, scaler,
-                        start_epoch, start_iter, model_config, ch_fpath)
+    # shape_of_first_layer = list(model.parameters())[0].shape #shape_of_first_layer
 
-    start_epoch = start_epoch[0]
-    total_iter = start_iter[0]
+    # N,C = shape_of_first_layer[:2]
 
-    criterion = FastPitchLoss(
-        dur_predictor_loss_scale=args.dur_predictor_loss_scale,
-        pitch_predictor_loss_scale=args.pitch_predictor_loss_scale,
-        attn_loss_scale=args.attn_loss_scale)
+    # dummy_input = torch.Tensor(N,C)
 
-    collate_fn = TTSCollate()
+    # dummy_input = dummy_input[...,:, None,None] #adding the None for height and weight
 
-    if args.local_rank == 0:
-        prepare_tmp(args.pitch_online_dir)
+    dummy_input = torch.load("/content/input-from-train.pt")
+    batch = torch.load("/content/input-from-train-batch.pt")
+    x, y, num_frames = batch_to_gpu(batch)
+    dummy_input = x
 
-    trainset = TTSDataset(audiopaths_and_text=args.training_files, **vars(args))
-    valset = TTSDataset(audiopaths_and_text=args.validation_files, **vars(args))
+    # print(f"ALL CHILDS: len {len(list(model.children()))}")
 
-    if distributed_run:
-        train_sampler, shuffle = DistributedSampler(trainset), False
-    else:
-        train_sampler, shuffle = None, True
+    # hooks = {}
+    # for name, module in model.named_modules():
+    #     hooks[name] = module.register_forward_hook(lambda mod, input_x, output : save_inputs(input_x, \
+    #     f"/content/output/modules_inputs/input-from-train-per-module-{name}.pt"))
 
-    # 4 workers are optimal on DGX-1 (from epoch 2 onwards)
-    train_loader = DataLoader(trainset, num_workers=4, shuffle=shuffle,
-                              sampler=train_sampler, batch_size=args.batch_size,
-                              pin_memory=True, persistent_workers=True,
-                              drop_last=True, collate_fn=collate_fn)
+    # print(f"Printing hooks!!!")
+    # print(hooks)
 
-    if args.ema_decay:
-        mt_ema_params = init_multi_tensor_ema(model, ema_model)
+    # for i, m in enumerate(list(model.children())):
+    #     print(f"ReGISTERED {i} = {m.__class__.__name__}")
+    #     filename = f"/content/output/modules_inputs/input-from-train-per-module.pt{i}"
+    #     # m.layer.register_forward_hook(lambda input, output : save_inputs(input, output, filename))
+    #     m.register_forward_hook(lambda mod, input_x, output : save_inputs(input_x, f"/content/output/modules_inputs/input-from-train-per-module-{i}.pt"))
 
-    model.train()
+    torch_out = model(dummy_input)
 
-    if args.pyprof:
-        torch.autograd.profiler.emit_nvtx().__enter__()
-        profiler.start()
+    print(f"Dummy inp worked!!")
 
-    epoch_loss = []
-    epoch_mel_loss = []
-    epoch_num_frames = []
-    epoch_frames_per_sec = []
-    epoch_time = []
 
-    torch.cuda.synchronize()
-    for epoch in range(start_epoch, args.epochs + 1):
-        epoch_start_time = time.perf_counter()
+    for name, module in modules:
+        cl_name=module.__class__.__name__
+        print(f"Name module: {cl_name}")
+        if cl_name == "":
+            continue
+        filename = f"/content/output/modules_inputs/input-from-train-per-module-{cl_name}.pt"
+        try:
+            dummy_input = torch.load(filename)
+        except:
+            print(f"No file for {cl_name}")
+            continue
+        export_to_onnx_or_torchscript(module, dummy_input, None, cl_name)
+        print(f"Exported {cl_name}")
 
-        epoch_loss += [0.0]
-        epoch_mel_loss += [0.0]
-        epoch_num_frames += [0]
-        epoch_frames_per_sec += [0.0]
+    # for i, m in enumerate(model.modules()):
+        # print(f"{i} -> {m}")
+        # print(m.__class__.__name__ )
+        # export_to_onnx(model, dummy_input)
 
-        if distributed_run:
-            train_loader.sampler.set_epoch(epoch)
+    print(f"EXPORTED!!")
+    exit(0)
 
-        accumulated_steps = 0
-        iter_loss = 0
-        iter_num_frames = 0
-        iter_meta = {}
-        iter_start_time = None
-
-        epoch_iter = 0
-        num_iters = len(train_loader) // args.grad_accumulation
-        for batch in train_loader:
-
-            if accumulated_steps == 0:
-                if epoch_iter == num_iters:
-                    break
-                total_iter += 1
-                epoch_iter += 1
-                if iter_start_time is None:
-                    iter_start_time = time.perf_counter()
-
-                adjust_learning_rate(total_iter, optimizer, args.learning_rate,
-                                     args.warmup_steps)
-
-                model.zero_grad(set_to_none=True)
-
-            x, y, num_frames = batch_to_gpu(batch)
-
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                y_pred = model(x)
-                loss, meta = criterion(y_pred, y)
-
-                if (args.kl_loss_start_epoch is not None
-                        and epoch >= args.kl_loss_start_epoch):
-
-                    if args.kl_loss_start_epoch == epoch and epoch_iter == 1:
-                        print('Begin hard_attn loss')
-
-                    _, _, _, _, _, _, _, _, attn_soft, attn_hard, _, _ = y_pred
-                    binarization_loss = attention_kl_loss(attn_hard, attn_soft)
-                    kl_weight = min((epoch - args.kl_loss_start_epoch) / args.kl_loss_warmup_epochs, 1.0) * args.kl_loss_weight
-                    meta['kl_loss'] = binarization_loss.clone().detach() * kl_weight
-                    loss += kl_weight * binarization_loss
-
-                else:
-                    meta['kl_loss'] = torch.zeros_like(loss)
-                    kl_weight = 0
-                    binarization_loss = 0
-
-                loss /= args.grad_accumulation
-
-            meta = {k: v / args.grad_accumulation
-                    for k, v in meta.items()}
-
-            if args.amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            if distributed_run:
-                reduced_loss = reduce_tensor(loss.data, args.world_size).item()
-                reduced_num_frames = reduce_tensor(num_frames.data, 1).item()
-                meta = {k: reduce_tensor(v, args.world_size) for k, v in meta.items()}
-            else:
-                reduced_loss = loss.item()
-                reduced_num_frames = num_frames.item()
-            if np.isnan(reduced_loss):
-                raise Exception("loss is NaN")
-
-            accumulated_steps += 1
-            iter_loss += reduced_loss
-            iter_num_frames += reduced_num_frames
-            iter_meta = {k: iter_meta.get(k, 0) + meta.get(k, 0) for k in meta}
-
-            if accumulated_steps % args.grad_accumulation == 0:
-
-                logger.log_grads_tb(total_iter, model)
-                if args.amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.grad_clip_thresh)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.grad_clip_thresh)
-                    optimizer.step()
-
-                if args.ema_decay > 0.0:
-                    apply_multi_tensor_ema(args.ema_decay, *mt_ema_params)
-
-                iter_time = time.perf_counter() - iter_start_time
-                iter_mel_loss = iter_meta['mel_loss'].item()
-                iter_kl_loss = iter_meta['kl_loss'].item()
-                epoch_frames_per_sec[-1] += iter_num_frames / iter_time
-                epoch_loss[-1] += iter_loss
-                epoch_num_frames[-1] += iter_num_frames
-                epoch_mel_loss[-1] += iter_mel_loss
-
-                logger.log((epoch, epoch_iter, num_iters),
-                           tb_total_steps=total_iter,
-                           subset='train',
-                           data=OrderedDict([
-                               ('loss', iter_loss),
-                               ('mel_loss', iter_mel_loss),
-                               ('kl_loss', iter_kl_loss),
-                               ('kl_weight', kl_weight),
-                               ('frames/s', iter_num_frames / iter_time),
-                               ('took', iter_time),
-                               ('lrate', optimizer.param_groups[0]['lr'])]),
-                           )
-
-                accumulated_steps = 0
-                iter_loss = 0
-                iter_num_frames = 0
-                iter_meta = {}
-                iter_start_time = time.perf_counter()
-
-        # Finished epoch
-        epoch_loss[-1] /= epoch_iter
-        epoch_mel_loss[-1] /= epoch_iter
-        epoch_time += [time.perf_counter() - epoch_start_time]
-        iter_start_time = None
-
-        logger.log((epoch,),
-                   tb_total_steps=None,
-                   subset='train_avg',
-                   data=OrderedDict([
-                       ('loss', epoch_loss[-1]),
-                       ('mel_loss', epoch_mel_loss[-1]),
-                       ('frames/s', epoch_num_frames[-1] / epoch_time[-1]),
-                       ('took', epoch_time[-1])]),
-                   )
-
-        validate(model, epoch, total_iter, criterion, valset, args.batch_size,
-                 collate_fn, distributed_run, batch_to_gpu)
-
-        if args.ema_decay > 0:
-            validate(ema_model, epoch, total_iter, criterion, valset,
-                     args.batch_size, collate_fn, distributed_run, batch_to_gpu,
-                     ema=True)
-
-        maybe_save_checkpoint(args, model, ema_model, optimizer, scaler, epoch,
-                              total_iter, model_config)
-        logger.flush()
-
-    # Finished training
-    if args.pyprof:
-        profiler.stop()
-        torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
-
-    if len(epoch_loss) > 0:
-        # Was trained - average the last 20 measurements
-        last_ = lambda l: np.asarray(l[-20:])
-        epoch_loss = last_(epoch_loss)
-        epoch_mel_loss = last_(epoch_mel_loss)
-        epoch_num_frames = last_(epoch_num_frames)
-        epoch_time = last_(epoch_time)
-        logger.log((),
-                   tb_total_steps=None,
-                   subset='train_avg',
-                   data=OrderedDict([
-                       ('loss', epoch_loss.mean()),
-                       ('mel_loss', epoch_mel_loss.mean()),
-                       ('frames/s', epoch_num_frames.sum() / epoch_time.sum()),
-                       ('took', epoch_time.mean())]),
-                   )
-
-    validate(model, None, total_iter, criterion, valset, args.batch_size,
-             collate_fn, distributed_run, batch_to_gpu)
 
 
 if __name__ == '__main__':

@@ -198,20 +198,20 @@ class FFTransformer(nn.Module):
             if self.word_emb is None:
                 inp = dec_inp
                 mask = mask_from_lens(seq_lens).unsqueeze(2)
-                proms = 0
+                proms = None
             else:
                 inp = self.word_emb(dec_inp)
                 # [bsz x L x 1]
                 mask = (dec_inp != self.padding_idx).unsqueeze(2)
                 if proms is None:
-                  proms = 0
+                  proms = None
                 else:
                   proms = self.prom_emb(proms) * mask
 
             pos_seq = torch.arange(inp.size(1), device=inp.device).to(inp.dtype)
             pos_emb = self.pos_emb(pos_seq) * mask
 
-            if proms != 0:
+            if proms is not None:
               drop_in = inp + proms + pos_emb + conditioning
             else:
               drop_in = inp + pos_emb + conditioning

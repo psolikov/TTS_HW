@@ -58,7 +58,10 @@ def regulate_len(durations, enc_out, pace: float = 1.0,
     enc_rep = torch.matmul(mult, enc_out)
 
     if mel_max_len is not None:
+        # mel_max_len = mel_max_len.cuda()
+        # dec_lens = dec_lens.detach()
         enc_rep = enc_rep[:, :mel_max_len]
+        mel_max_len = torch.tensor(mel_max_len, device="cuda:0")
         dec_lens = torch.clamp_max(dec_lens, mel_max_len)
     return enc_rep, dec_lens
 
